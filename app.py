@@ -9,12 +9,19 @@ import urllib.request
 import json
 
 app = Flask(__name__)
-limiter = Limiter(app, key_func=get_remote_address, default_limits=["20 per minute"])
+
+# ✅ CORRECTED: Flask-Limiter v3+ syntax
+limiter = Limiter(
+    app=app,
+    key_func=get_remote_address,
+    default_limits=["20 per minute"]
+)
+
 cache = {}
 cache_lock = threading.Lock()
-CACHE_DURATION = 60
+CACHE_DURATION = 60  # seconds
 
-# ===== TIER 1: yfinance (Primary) =====
+# ===== TIER 1: yfinance =====
 def fetch_yfinance(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -23,20 +30,19 @@ def fetch_yfinance(ticker):
             return f"{float(hist['Close'].iloc[-1]):.2f}"
         info = stock.info
         price = info.get('regularMarketPrice') or info.get('currentPrice')
-        return f"{float(price):.2f}" if price else None
+        return f"{float(price):.2f}" if price is not None else None
     except Exception as e:
         print(f"[YF_FAIL] {ticker}: {str(e)[:80]}")
         return None
 
-# ===== TIER 2: Yahoo Finance Public JSON (Direct HTTP) =====
+# ===== TIER 2: Direct Yahoo Finance API (no yfinance) =====
 def fetch_yahoo_direct(ticker):
     try:
-        # 🔥 FIXED: Removed extra space in URL (critical bug!)
+        # 🔥 NO SPACE in URL — critical fix
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=4) as resp:
+        with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode())
-            # Safely navigate nested structure
             result = data.get('chart', {}).get('result')
             if result and len(result) > 0:
                 price = result[0].get('meta', {}).get('regularMarketPrice')
@@ -46,8 +52,9 @@ def fetch_yahoo_direct(ticker):
         print(f"[YAHOO_DIRECT_FAIL] {ticker}: {str(e)[:80]}")
         return None
 
-# ===== Unified Fetcher (Only Tier 1 + Tier 2) =====
+# ===== Unified Price Fetcher =====
 def get_stock_price(ticker):
+    # Strict validation: e.g., AAPL, BRK.B, BF.B — no junk
     if not re.fullmatch(r'^[A-Z][A-Z0-9]{0,4}(\.[A-Z]{1,2})?$', ticker):
         return None
 
@@ -57,7 +64,7 @@ def get_stock_price(ticker):
 
     # Try Tier 1 → Tier 2
     price = fetch_yfinance(ticker) or fetch_yahoo_direct(ticker)
-    
+
     if price:
         with cache_lock:
             cache[ticker] = {'price': price, 'timestamp': time.time()}
@@ -71,7 +78,7 @@ def price():
     if not ticker:
         return jsonify({"error": "Missing ticker"}), 400
     price_data = get_stock_price(ticker)
-    if price_data:
+    if price_
         return jsonify({"ticker": ticker, "price": price_data})
     return jsonify({"error": "Data unavailable"}), 404
 
@@ -79,6 +86,8 @@ def price():
 def health():
     return jsonify({"status": "ghost_online"})
 
+# ===== Run =====
 if __name__ == '__main__':
+    import os
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
