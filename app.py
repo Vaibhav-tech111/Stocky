@@ -1,79 +1,84 @@
-import requests
-from bs4 import BeautifulSoup
+import yfinance as yf
 from flask import Flask, jsonify, request
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 import time
-import os
+import threading
 import re
-import json # <-- JSON library import kar lijiye
+import urllib.request
+import json
 
 app = Flask(__name__)
-
+limiter = Limiter(app, key_func=get_remote_address, default_limits=["20 per minute"])
 cache = {}
-CACHE_DURATION_SECONDS = 10
+cache_lock = threading.Lock()
+CACHE_DURATION = 60
 
-def get_stock_price(ticker):
-    # Check cache first
-    if ticker in cache and time.time() - cache[ticker]['timestamp'] < CACHE_DURATION_SECONDS:
-        return cache[ticker]['price']
-
+# ===== TIER 1: yfinance (Primary) =====
+def fetch_yfinance(ticker):
     try:
-        url = f"https://finance.yahoo.com/quote/{ticker}"
-        # Enhanced headers to look exactly like a real browser
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/108.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Referer': 'https://finance.yahoo.com/',
-            'Connection': 'keep-alive',
-        }
-        response = requests.get(url, headers=headers, timeout=7)
-        response.raise_for_status()
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period="1d", interval="1m")
+        if not hist.empty:
+            return f"{float(hist['Close'].iloc[-1]):.2f}"
+        info = stock.info
+        price = info.get('regularMarketPrice') or info.get('currentPrice')
+        return f"{float(price):.2f}" if price else None
+    except Exception as e:
+        print(f"[YF_FAIL] {ticker}: {str(e)[:80]}")
+        return None
 
-        # --- NEW STEALTH METHOD: Scrape the embedded JSON data ---
-        # This is the most reliable way.
-        json_match = re.search(r'root\.App\.main = ({.*?});', response.text)
-        if json_match:
-            json_str = json_match.group(1)
-            data = json.loads(json_str)
-            
-            # Navigate the JSON path to the price
-            price = data['context']['dispatcher']['stores']['QuoteSummaryStore']['price']['regularMarketPrice']['fmt']
-            
-            if price:
-                cache[ticker] = {'price': price, 'timestamp': time.time()}
-                return price
+# ===== TIER 2: Yahoo Finance Public JSON (Direct HTTP) =====
+def fetch_yahoo_direct(ticker):
+    try:
+        # 🔥 FIXED: Removed extra space in URL (critical bug!)
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1m&range=1d"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            data = json.loads(resp.read().decode())
+            # Safely navigate nested structure
+            result = data.get('chart', {}).get('result')
+            if result and len(result) > 0:
+                price = result[0].get('meta', {}).get('regularMarketPrice')
+                if price is not None:
+                    return f"{float(price):.2f}"
+    except Exception as e:
+        print(f"[YAHOO_DIRECT_FAIL] {ticker}: {str(e)[:80]}")
+        return None
 
-        # --- FALLBACK METHOD: Old HTML scraping (if JSON fails) ---
-        soup = BeautifulSoup(response.text, 'html.parser')
-        price_element = soup.find('fin-streamer', {'data-symbol': ticker.upper(), 'data-field': 'regularMarketPrice'})
-        
-        if price_element:
-            price = price_element.text.strip()
+# ===== Unified Fetcher (Only Tier 1 + Tier 2) =====
+def get_stock_price(ticker):
+    if not re.fullmatch(r'^[A-Z][A-Z0-9]{0,4}(\.[A-Z]{1,2})?$', ticker):
+        return None
+
+    with cache_lock:
+        if ticker in cache and time.time() - cache[ticker]['timestamp'] < CACHE_DURATION:
+            return cache[ticker]['price']
+
+    # Try Tier 1 → Tier 2
+    price = fetch_yfinance(ticker) or fetch_yahoo_direct(ticker)
+    
+    if price:
+        with cache_lock:
             cache[ticker] = {'price': price, 'timestamp': time.time()}
-            return price
+    return price
 
-        # If both methods fail
-        return None
-
-    except (requests.exceptions.RequestException, json.JSONDecodeError, KeyError):
-        # Network error, or JSON structure changed, or key not found in JSON
-        return None
-    except Exception:
-        return None
-
+# ===== Routes =====
 @app.route('/price')
+@limiter.limit("5 per minute")
 def price():
-    ticker = request.args.get('ticker')
+    ticker = request.args.get('ticker', '').strip().upper()
     if not ticker:
-        return jsonify({"error": "Ticker parameter is missing. Example: /price?ticker=AAPL"}), 400
-
+        return jsonify({"error": "Missing ticker"}), 400
     price_data = get_stock_price(ticker)
     if price_data:
-        return jsonify({"ticker": ticker.upper(), "price": price_data})
-    else:
-        return jsonify({"error": f"Could not retrieve price for ticker: {ticker}. Enemy defenses may have been upgraded again."}), 404
+        return jsonify({"ticker": ticker, "price": price_data})
+    return jsonify({"error": "Data unavailable"}), 404
 
-# YEH hisse waisa ka waisa hai
+@app.route('/health')
+def health():
+    return jsonify({"status": "ghost_online"})
+
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
